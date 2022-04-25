@@ -1,3 +1,13 @@
+# Saved Python objects:
+*.dill
+
+# Scratchpad notebooks:
+scribble.ipynb
+playground.ipynb
+
+# VS Code:
+.vscode/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
