@@ -8,9 +8,9 @@ import gym
 from tqdm import tqdm
 import dill
 
-from agent_history import AgentHistoryBase, TabularAgentHistory
-from q_approximators import QApproximatorBase, TabularQApproximator
-from policies import PolicyBase, GreedyPolicy
+from .agent_history import AgentHistoryBase, TabularAgentHistory
+from .q_approximators import QApproximatorBase, TabularQApproximator
+from .policies import PolicyBase, GreedyPolicy
 
 
 class AgentBase(ABC):

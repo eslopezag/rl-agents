@@ -6,7 +6,7 @@ import numpy as np
 from numpy import typing as npt
 import gym
 
-from q_approximators import QApproximatorBase
+from .q_approximators import QApproximatorBase
 
 
 StateType = Union[int, float, List[float], npt.NDArray[np.float64]]

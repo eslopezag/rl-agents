@@ -5,7 +5,7 @@ from itertools import chain
 import numpy as np
 from matplotlib import pyplot as plt
 
-from q_approximators import QApproximatorBase, TabularQApproximator
+from .q_approximators import QApproximatorBase, TabularQApproximator
 
 
 class AgentHistoryBase(ABC):
