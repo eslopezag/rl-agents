@@ -3,3 +3,4 @@ gym~=0.22.0
 pygame~=2.1.2
 tqdm~=4.63.1
 dill~=0.3.4
+tensorflow~=2.8.0

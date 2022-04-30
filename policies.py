@@ -4,9 +4,10 @@ from functools import wraps
 
 import numpy as np
 from numpy import typing as npt
+import tensorflow as tf
 import gym
 
-from .q_approximators import QApproximatorBase
+from .q_approximators import QApproximatorBase, GradQApproximator
 
 
 StateType = Union[int, float, List[float], npt.NDArray[np.float64]]
@@ -51,6 +52,24 @@ def softmax_tau(
     return res
 
 
+def softmax_tau_batch(
+    arr: tf.Tensor,  # shape: (n_samples, n_actions)
+    tau: float,
+) -> npt.NDArray[np.float64]:
+    """
+    Softmax function with temperature parameter `tau` over a batch of samples
+    given as a TensorFlow tensor.
+    """
+    res = arr / tau
+
+    # The row-wise maximum is subtracted for stability:
+    res = tf.exp(res - tf.reduce_max(res, axis=1, keepdims=True))
+
+    res = res / tf.reduce_sum(res, axis=1, keepdims=True)
+
+    return res
+
+
 class PolicyBase(ABC):
     @abstractmethod
     def get_action(self, state: StateType) -> int:
@@ -58,6 +77,28 @@ class PolicyBase(ABC):
 
     @abstractmethod
     def get_probs(self, state: StateType) -> npt.NDArray[np.float64]:
+        pass
+
+    @abstractmethod
+    def get_probs_from_Q_batch(
+        self,
+        Q_state_batch: tf.Tensor,  # shape: (n_samples, n_actions)
+    ) -> npt.NDArray[np.float64]:  # Two-dimensional array
+        """
+        Gets the action selection probabilities from the action-values
+        associated with a batch of states in a vectorized manner.
+
+        Args:
+            Q_state_batch:
+                a two-dimensional array such that its (i, j) component is the
+                estimated action-value of the j-th action when the agent is at
+                the i-th item of a batch of states.
+
+        Returns:
+            A two-dimensional array such that its (i, j) component is the
+            probability of selecting the j-th action when the agent is at
+            the i-th item of a batch of states.
+        """
         pass
 
     @abstractmethod
@@ -146,8 +187,30 @@ class TabularActionsPolicyBase(PolicyBase, ABC):
     @abstractmethod
     def get_probs(self, state: StateType) -> npt.NDArray[np.float64]:
         """
-        Returns anb array with the probability of each action being selected by
+        Returns an array with the probability of each action being selected by
         the policy at the given state.
+        """
+        pass
+
+    @abstractmethod
+    def get_probs_from_Q_batch(
+        self,
+        Q_state_batch: tf.Tensor,  # shape: (n_samples, n_actions)
+    ) -> npt.NDArray[np.float64]:  # Two-dimensional array
+        """
+        Gets the action selection probabilities from the action-values
+        associated with a batch of states in a vectorized manner.
+
+        Args:
+            Q_state_batch:
+                a two-dimensional array such that its (i, j) component is the
+                estimated action-value of the j-th action when the agent is at
+                the i-th item of a batch of states.
+
+        Returns:
+            A two-dimensional array such that its (i, j) component is the
+            probability of selecting the j-th action when the agent is at
+            the i-th item of a batch of states.
         """
         pass
 
@@ -186,6 +249,42 @@ class GreedyPolicy(TabularActionsPolicyBase):
         max_indices = multi_argmax(self.Q[state])
         probs = np.zeros(self.n_actions)
         probs[max_indices] = 1. / max_indices.size
+
+        return probs
+
+    @check_Q_is_set
+    def get_probs_from_Q_batch(
+        self,
+        Q_state_batch: tf.Tensor,  # shape: (n_samples, n_actions)
+    ) -> npt.NDArray[np.float64]:  # Two-dimensional array
+        """
+        Gets the action selection probabilities from the action-values
+        associated with a batch of states in a vectorized manner.
+
+        Args:
+            Q_state_batch:
+                a two-dimensional array such that its (i, j) component is the
+                estimated action-value of the j-th action when the agent is at
+                the i-th item of a batch of states.
+
+        Returns:
+            A two-dimensional array such that its (i, j) component is the
+            probability of selecting the j-th action when the agent is at
+            the i-th item of a batch of states.
+        """
+        if not isinstance(self.Q, GradQApproximator):
+            raise NotImplementedError(
+                'the `get_probs_from_Q_batch` method can only be used if the '
+                '`Q` attribute is a `GradQApproximator` object.'
+            )
+
+        probs = np.where(
+            Q_state_batch == np.max(Q_state_batch, axis=1, keepdims=True),
+            1.,
+            0.
+        )
+
+        probs /= np.sum(probs, axis=1, keepdims=True)
 
         return probs
 
@@ -231,7 +330,7 @@ class EpsGreedyPolicy(TabularActionsPolicyBase):
     @check_Q_is_set
     def get_probs(self, state: StateType) -> npt.NDArray[np.float64]:
         """
-        Returns anb array with the probability of each action being selected by
+        Returns an array with the probability of each action being selected by
         the policy at the given state.
         """
         probs = np.full(
@@ -244,6 +343,46 @@ class EpsGreedyPolicy(TabularActionsPolicyBase):
 
         for i in argmax_indices:
             probs[i] += (1 - self.eps) / argmax_indices.size
+
+        return probs
+
+    @check_Q_is_set
+    def get_probs_from_Q_batch(
+        self,
+        Q_state_batch: tf.Tensor,  # shape: (n_samples, n_actions)
+    ) -> npt.NDArray[np.float64]:  # Two-dimensional array
+        """
+        Gets the action selection probabilities from the action-values
+        associated with a batch of states in a vectorized manner.
+
+        Args:
+            Q_state_batch:
+                a two-dimensional array such that its (i, j) component is the
+                estimated action-value of the j-th action when the agent is at
+                the i-th item of a batch of states.
+
+        Returns:
+            A two-dimensional array such that its (i, j) component is the
+            probability of selecting the j-th action when the agent is at
+            the i-th item of a batch of states.
+        """
+        if not isinstance(self.Q, GradQApproximator):
+            raise NotImplementedError(
+                'the `get_probs_from_Q_batch` method can only be used if the '
+                '`Q` attribute is a `GradQApproximator` object.'
+            )
+        mask = (Q_state_batch == np.max(Q_state_batch, axis=1, keepdims=True))
+
+        probs = np.where(
+            mask,
+            1. - self.eps,
+            0.
+        )
+
+        probs = (
+            probs / np.sum(mask, axis=1, keepdims=True)
+            + self.eps / probs.shape[1]
+        )
 
         return probs
 
@@ -291,10 +430,39 @@ class SoftmaxPolicy(TabularActionsPolicyBase):
     @check_Q_is_set
     def get_probs(self, state: StateType) -> npt.NDArray[np.float64]:
         """
-        Returns anb array with the probability of each action being selected by
+        Returns an array with the probability of each action being selected by
         the policy at the given state.
         """
         probs = softmax_tau(self.Q[state], self.tau)
+        return probs
+
+    @check_Q_is_set
+    def get_probs_from_Q_batch(
+        self,
+        Q_state_batch: tf.Tensor,  # shape: (n_samples, n_actions)
+    ) -> npt.NDArray[np.float64]:  # Two-dimensional array
+        """
+        Gets the action selection probabilities from the action-values
+        associated with a batch of states in a vectorized manner.
+
+        Args:
+            Q_state_batch:
+                a two-dimensional array such that its (i, j) component is the
+                estimated action-value of the j-th action when the agent is at
+                the i-th item of a batch of states.
+
+        Returns:
+            A two-dimensional array such that its (i, j) component is the
+            probability of selecting the j-th action when the agent is at
+            the i-th item of a batch of states.
+        """
+        if not isinstance(self.Q, GradQApproximator):
+            raise NotImplementedError(
+                'the `get_probs_from_Q_batch` method can only be used if the '
+                '`Q` attribute is a `GradQApproximator` object.'
+            )
+
+        probs = softmax_tau_batch(Q_state_batch, self.tau)
         return probs
 
     def run_scheduler(self, step: int, episode: int) -> None:

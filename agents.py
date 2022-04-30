@@ -4,12 +4,15 @@ from datetime import datetime
 
 import numpy as np
 from numpy import typing as npt
+import tensorflow as tf
 import gym
 from tqdm import tqdm
 import dill
 
 from .agent_history import AgentHistoryBase, TabularAgentHistory
-from .q_approximators import QApproximatorBase, TabularQApproximator
+from .q_approximators import (
+    QApproximatorBase, TabularQApproximator, GradQApproximator
+)
 from .policies import PolicyBase, GreedyPolicy
 
 
@@ -31,7 +34,7 @@ class AgentBase(ABC):
         self.Q = Q
         self.history = history
 
-        # Set the flag that specifies whether the firsty transition of an
+        # Set the flag that specifies whether the first transition of an
         # episode counts as a step:
         self.step_on_episode_start = step_on_episode_start
 
@@ -90,12 +93,39 @@ class AgentBase(ABC):
             self.history.register_episode_end()
 
     @abstractmethod
+    def target_fn(
+        self,
+        reward: float,
+        state: Union[int, float, npt.NDArray[np.float64]],
+        action: int,
+    ) -> float:
+        pass
+
     def train_step(
         self,
         state: Union[int, float, npt.NDArray[np.float64]],
         reward: Union[float, int],
     ) -> Union[int, float, npt.NDArray[np.float64]]:
-        pass
+        if self.mode != 'training':
+            raise Exception('The agent cannot be trained in inference mode.')
+
+        # Get action from policy:
+        action = self.get_action(state)
+
+        if self.last_state is not None and self.last_action is not None:
+            self.Q.update(
+                self.last_state,
+                self.last_action,
+                reward,
+                state,
+                action,
+                self.target_fn,
+            )
+
+        self.last_state = state
+        self.last_action = action
+
+        return action
 
     def _reset_env(self) -> Union[int, float, npt.NDArray[np.float64]]:
         observation = self.env.reset()
@@ -151,7 +181,8 @@ class AgentBase(ABC):
 
         self.env.close()
 
-        print(self.Q)
+        if isinstance(self.Q, np.ndarray) and max(self.Q.shape) <= 128:
+            print(self.Q)
 
         # This step seems to be necessary so that dill properly saves the `Q`
         # attribute of the object in the call to `dill.dump`:
@@ -171,7 +202,7 @@ class TabularSarsaAgent(AgentBase):
         Q: TabularQApproximator,
         history: TabularAgentHistory,
         target_policy: PolicyBase,
-        discount: float = 1,
+        discount: float = 1.,
         mode: str = 'training',
         output_filename: Optional[str] = None,
     ) -> None:
@@ -197,25 +228,13 @@ class TabularSarsaAgent(AgentBase):
     def run_policies_schedulers(self) -> None:
         self.policy.run_scheduler(self.step, self.episode)
 
-    def train_step(
+    def target_fn(
         self,
+        reward: float,
         state: Union[int, float, npt.NDArray[np.float64]],
-        reward: Union[float, int],
-    ) -> Union[int, float, npt.NDArray[np.float64]]:
-        if self.mode != 'training':
-            raise Exception('The agent cannot be trained in inference mode.')
-
-        # Get action from policy:
-        action = self.get_action(state)
-
-        if self.last_state is not None and self.last_action is not None:
-            target = reward + self.discount * self.Q[state, action]
-            self.Q.update(self.last_state, self.last_action, target)
-
-        self.last_state = state
-        self.last_action = action
-
-        return action
+        action: int,
+    ) -> float:
+        return reward + self.discount * self.Q[state, action]
 
 
 class TabularQLearningAgent(AgentBase):
@@ -225,7 +244,7 @@ class TabularQLearningAgent(AgentBase):
         Q: TabularQApproximator,
         history: TabularAgentHistory,
         exploration_policy: PolicyBase,
-        discount: float = 1,
+        discount: float = 1.,
         mode: str = 'training',
         output_filename: Optional[str] = None,
     ) -> None:
@@ -250,25 +269,13 @@ class TabularQLearningAgent(AgentBase):
     def run_policies_schedulers(self) -> None:
         self.exploration_policy.run_scheduler(self.step, self.episode)
 
-    def train_step(
+    def target_fn(
         self,
+        reward: float,
         state: Union[int, float, npt.NDArray[np.float64]],
-        reward: Union[float, int],
-    ) -> Union[int, float, npt.NDArray[np.float64]]:
-        if self.mode != 'training':
-            raise Exception('The agent cannot be trained in inference mode.')
-
-        # Get action from policy:
-        action = self.get_action(state)
-
-        if self.last_state is not None and self.last_action is not None:
-            target = reward + self.discount * np.max(self.Q[state])
-            self.Q.update(self.last_state, self.last_action, target)
-
-        self.last_state = state
-        self.last_action = action
-
-        return action
+        action: int,
+    ) -> float:
+        return reward + self.discount * np.max(self.Q[state])
 
 
 class TabularExpectedSarsaAgent(AgentBase):
@@ -305,25 +312,342 @@ class TabularExpectedSarsaAgent(AgentBase):
         self.target_policy.run_scheduler(self.step, self.episode)
         self.exploration_policy.run_scheduler(self.step, self.episode)
 
-    def train_step(
+    def target_fn(
         self,
+        reward: float,
         state: Union[int, float, npt.NDArray[np.float64]],
-        reward: Union[float, int],
-    ) -> Union[int, float, npt.NDArray[np.float64]]:
-        if self.mode != 'training':
-            raise Exception('The agent cannot be trained in inference mode.')
+        action: int,
+    ) -> float:
+        target = (
+            reward + self.discount *
+            np.dot(self.target_policy.get_probs(state), self.Q[state])
+        )
 
-        # Get action from policy:
-        action = self.get_action(state)
+        return target
 
-        if self.last_state is not None and self.last_action is not None:
-            target = (
-                reward + self.discount *
-                np.dot(self.target_policy.get_probs(state), self.Q[state])
+
+class SemiGradSarsaAgent(AgentBase):
+    def __init__(
+        self,
+        env: gym.Env,
+        Q: GradQApproximator,
+        history: AgentHistoryBase,
+        target_policy: PolicyBase,
+        discount: float = 1.,
+        mode: str = 'training',
+        output_filename: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            env=env,
+            Q=Q,
+            history=history,
+            step_on_episode_start=False,
+            target_policy=target_policy,
+            exploration_policy=target_policy,
+            discount=discount,
+            mode=mode,
+            output_filename=output_filename,
+        )
+        self.policy = target_policy
+
+    def get_action(self, state) -> int:
+        return super().get_action(state)
+
+    def _reset_env(self) -> Union[int, float, npt.NDArray[np.float64]]:
+        return super()._reset_env()
+
+    def run_policies_schedulers(self) -> None:
+        self.policy.run_scheduler(self.step, self.episode)
+
+    def target_fn(
+        self,
+        rewards: npt.NDArray[np.float64],
+        states: npt.NDArray[np.float64],  # Two-dimensional array
+        actions: npt.NDArray[np.int64],
+        state_is_terminal: npt.NDArray[np.bool],
+    ) -> float:
+        next_Q = tf.where(
+            state_is_terminal,
+            0.,
+            tf.boolean_mask(self.Q.model(states), self.Q.masks[actions])
+        )
+
+        target = rewards + self.discount * next_Q
+
+        # This step makes sure that the target is not taken into account when
+        # differenating with respect to the model parameters so that a
+        # semi-gradient update is performed:
+        target = target.numpy()
+
+        return target
+
+
+class SemiGradQLearningAgent(AgentBase):
+    def __init__(
+        self,
+        env: gym.Env,
+        Q: GradQApproximator,
+        history: TabularAgentHistory,
+        exploration_policy: PolicyBase,
+        discount: float = 1.,
+        mode: str = 'training',
+        output_filename: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            env=env,
+            Q=Q,
+            history=history,
+            step_on_episode_start=False,
+            target_policy=GreedyPolicy(),
+            exploration_policy=exploration_policy,
+            discount=discount,
+            mode=mode,
+            output_filename=output_filename,
+        )
+
+    def get_action(self, state) -> int:
+        return super().get_action(state)
+
+    def _reset_env(self) -> Union[int, float, npt.NDArray[np.float64]]:
+        return super()._reset_env()
+
+    def run_policies_schedulers(self) -> None:
+        self.exploration_policy.run_scheduler(self.step, self.episode)
+
+    def target_fn(
+        self,
+        rewards: npt.NDArray[np.float64],
+        states: npt.NDArray[np.float64],  # Two-dimensional array
+        actions: npt.NDArray[np.int64],
+        state_is_terminal: npt.NDArray[np.bool],
+    ) -> float:
+        next_Q = tf.where(
+            state_is_terminal,
+            0.,
+            tf.reduce_max(self.Q.model(states), axis=1)
+        )
+
+        target = rewards + self.discount * next_Q
+
+        # This step makes sure that the target is not taken into account when
+        # differenating with respect to the model parameters so that a
+        # semi-gradient update is performed:
+        target = target.numpy()
+
+        return target
+
+
+class SemiGradExpectedSarsaAgent(AgentBase):
+    def __init__(
+        self,
+        env: gym.Env,
+        Q: GradQApproximator,
+        history: TabularAgentHistory,
+        target_policy: PolicyBase,
+        exploration_policy: PolicyBase,
+        discount: float = 1.,
+        mode: str = 'training',
+        output_filename: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            env=env,
+            Q=Q,
+            history=history,
+            step_on_episode_start=False,
+            target_policy=target_policy,
+            exploration_policy=exploration_policy,
+            discount=discount,
+            mode=mode,
+            output_filename=output_filename,
+        )
+
+    def get_action(self, state) -> int:
+        return super().get_action(state)
+
+    def _reset_env(self) -> Union[int, float, npt.NDArray[np.float64]]:
+        return super()._reset_env()
+
+    def run_policies_schedulers(self) -> None:
+        self.target_policy.run_scheduler(self.step, self.episode)
+        self.exploration_policy.run_scheduler(self.step, self.episode)
+
+    def target_fn(
+        self,
+        rewards: npt.NDArray[np.float64],
+        states: npt.NDArray[np.float64],  # Two-dimensional array
+        actions: npt.NDArray[np.int64],
+        state_is_terminal: npt.NDArray[np.bool],
+    ) -> float:
+        Q_state_batch = self.Q.model(states)
+
+        next_Q = tf.where(
+            state_is_terminal,
+            0.,
+            tf.reduce_sum(
+                self.target_policy.get_probs_from_Q_batch(Q_state_batch) *
+                Q_state_batch,
+                axis=1
             )
-            self.Q.update(self.last_state, self.last_action, target)
+        )
 
-        self.last_state = state
-        self.last_action = action
+        target = rewards + self.discount * next_Q
 
-        return action
+        # This step makes sure that the target is not taken into account when
+        # differenating with respect to the model parameters so that a
+        # semi-gradient update is performed:
+        target = target.numpy()
+
+        return target
+
+
+class TrueGradSarsaAgent(AgentBase):
+    def __init__(
+        self,
+        env: gym.Env,
+        Q: GradQApproximator,
+        history: AgentHistoryBase,
+        target_policy: PolicyBase,
+        discount: float = 1.,
+        mode: str = 'training',
+        output_filename: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            env=env,
+            Q=Q,
+            history=history,
+            step_on_episode_start=False,
+            target_policy=target_policy,
+            exploration_policy=target_policy,
+            discount=discount,
+            mode=mode,
+            output_filename=output_filename,
+        )
+        self.policy = target_policy
+
+    def get_action(self, state) -> int:
+        return super().get_action(state)
+
+    def _reset_env(self) -> Union[int, float, npt.NDArray[np.float64]]:
+        return super()._reset_env()
+
+    def run_policies_schedulers(self) -> None:
+        self.policy.run_scheduler(self.step, self.episode)
+
+    def target_fn(
+        self,
+        rewards: npt.NDArray[np.float64],
+        states: npt.NDArray[np.float64],  # Two-dimensional array
+        actions: npt.NDArray[np.int64],
+        state_is_terminal: npt.NDArray[np.bool],
+    ) -> float:
+        next_Q = tf.where(
+            state_is_terminal,
+            0.,
+            tf.boolean_mask(self.Q.model(states), self.Q.masks[actions])
+        )
+
+        return rewards + self.discount * next_Q
+
+
+class TrueGradQLearningAgent(AgentBase):
+    def __init__(
+        self,
+        env: gym.Env,
+        Q: GradQApproximator,
+        history: TabularAgentHistory,
+        exploration_policy: PolicyBase,
+        discount: float = 1.,
+        mode: str = 'training',
+        output_filename: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            env=env,
+            Q=Q,
+            history=history,
+            step_on_episode_start=False,
+            target_policy=GreedyPolicy(),
+            exploration_policy=exploration_policy,
+            discount=discount,
+            mode=mode,
+            output_filename=output_filename,
+        )
+
+    def get_action(self, state) -> int:
+        return super().get_action(state)
+
+    def _reset_env(self) -> Union[int, float, npt.NDArray[np.float64]]:
+        return super()._reset_env()
+
+    def run_policies_schedulers(self) -> None:
+        self.exploration_policy.run_scheduler(self.step, self.episode)
+
+    def target_fn(
+        self,
+        rewards: npt.NDArray[np.float64],
+        states: npt.NDArray[np.float64],  # Two-dimensional array
+        actions: npt.NDArray[np.int64],
+        state_is_terminal: npt.NDArray[np.bool],
+    ) -> float:
+        next_Q = tf.where(
+            state_is_terminal,
+            0.,
+            tf.reduce_max(self.Q.model(states), axis=1)
+        )
+
+        return rewards + self.discount * next_Q
+
+
+class TrueGradExpectedSarsaAgent(AgentBase):
+    def __init__(
+        self,
+        env: gym.Env,
+        Q: GradQApproximator,
+        history: TabularAgentHistory,
+        target_policy: PolicyBase,
+        exploration_policy: PolicyBase,
+        discount: float = 1.,
+        mode: str = 'training',
+        output_filename: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            env=env,
+            Q=Q,
+            history=history,
+            step_on_episode_start=False,
+            target_policy=target_policy,
+            exploration_policy=exploration_policy,
+            discount=discount,
+            mode=mode,
+            output_filename=output_filename,
+        )
+
+    def get_action(self, state) -> int:
+        return super().get_action(state)
+
+    def _reset_env(self) -> Union[int, float, npt.NDArray[np.float64]]:
+        return super()._reset_env()
+
+    def run_policies_schedulers(self) -> None:
+        self.target_policy.run_scheduler(self.step, self.episode)
+        self.exploration_policy.run_scheduler(self.step, self.episode)
+
+    def target_fn(
+        self,
+        rewards: npt.NDArray[np.float64],
+        states: npt.NDArray[np.float64],  # Two-dimensional array
+        actions: npt.NDArray[np.int64],
+        state_is_terminal: npt.NDArray[np.bool],
+    ) -> float:
+        Q_state_batch = self.Q.model(states)
+
+        next_Q = tf.where(
+            state_is_terminal,
+            0.,
+            tf.reduce_sum(
+                self.target_policy.get_probs_from_Q_batch(Q_state_batch) *
+                Q_state_batch,
+                axis=1
+            )
+        )
+
+        return rewards + self.discount * next_Q

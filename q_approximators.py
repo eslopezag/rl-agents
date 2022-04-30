@@ -1,22 +1,24 @@
 from abc import ABC, abstractmethod
-from typing import Optional, Union, List, Callable
+from typing import Optional, Union, List, Callable, Tuple
 
 import numpy as np
 from numpy import typing as npt
+import tensorflow as tf
 import gym
+
+from .experience_buffers import ExperienceBufferBase, OrderedExperienceBuffer
 
 
 class QApproximatorBase(ABC):
     @abstractmethod
-    def update(self, state: int, action: int, target: float) -> None:
-        pass
-
-    @abstractmethod
-    def batch_update(
+    def update(
         self,
-        states: npt.NDArray[np.int64],
-        actions: npt.NDArray[np.int64],
-        targets: npt.NDArray[np.float64],
+        last_state: Union[int, float, npt.NDArray[np.float64]],
+        last_action: int,
+        reward: float,
+        new_state: Union[int, float, npt.NDArray[np.float64]],
+        new_action: int,
+        target_fn: Callable,
     ) -> None:
         pass
 
@@ -130,15 +132,131 @@ class TabularQApproximator(np.ndarray, QApproximatorBase):
             terminal_states,
         )
 
-    def update(self, state: int, action: int, target: float) -> None:
-        self[state, action] += self.step_size * (target - self[state, action])
-
-    def batch_update(
+    def update(
         self,
-        states: npt.NDArray[np.int64],
-        actions: npt.NDArray[np.int64],
-        targets: npt.NDArray[np.float64],
+        last_state: Union[int, float, npt.NDArray[np.float64]],
+        last_action: int,
+        reward: float,
+        new_state: Union[int, float, npt.NDArray[np.float64]],
+        new_action: int,
+        target_fn: Callable,
     ) -> None:
-        raise NotImplementedError(
-            '`TabularQApproximator` cannot perform batch updates.'
+        target = target_fn(reward, new_state, new_action)
+        self[last_state, last_action] += self.step_size * (
+            target - self[last_state, last_action]
         )
+
+
+class GradQApproximator(QApproximatorBase):
+    def __init__(
+        self,
+        model: Callable,
+        optimizer: tf.keras.optimizers.Optimizer,
+        state_dim: int,
+        buffer_size: int,
+        buffer_class: type = OrderedExperienceBuffer,
+        scheduler: Optional[Callable] = None,
+        is_terminal_fn: Optional[Callable] = None,
+        *,
+        env: Optional[gym.Env] = None,
+        n_actions: Optional[int] = None,
+    ) -> None:
+        self.model = model
+        self.optimizer = optimizer
+
+        if not ExperienceBufferBase.__subclasscheck__(buffer_class):
+            raise ValueError(
+                'The `buffer_class` parameter must be a subclass of '
+                f'{ExperienceBufferBase}.'
+            )
+
+        self.buffer = buffer_class(buffer_size, state_dim)
+        self.scheduler = scheduler
+        self.is_terminal_fn = is_terminal_fn
+
+        if env is not None:
+            self.n_actions = env.action_space.n
+        elif n_actions is not None:
+            self.n_actions = n_actions
+        else:
+            raise ValueError(
+                'Either `env` or `n_actions` must be specified.'
+            )
+
+        self.shape = (np.inf, self.n_actions)
+
+        self.masks = np.eye(self.n_actions, dtype=bool)
+
+    def __getitem__(
+        self,
+        state_action_tuple: Union[
+            Tuple[
+                Union[int, float, npt.NDArray[np.float64]],
+                Union[int, slice]
+            ],
+            Union[int, float, npt.NDArray[np.float64]]
+        ],
+    ) -> float:
+        if isinstance(state_action_tuple, tuple):
+            state, action = state_action_tuple
+        else:
+            state = state_action_tuple
+            action = slice(None)
+
+        if isinstance(state, (int, float)):
+            return self.model.predict(
+                np.array(state, dtype=np.float64)[None, None]
+            ).squeeze()[action]
+        else:
+            return self.model.predict(state[None]).squeeze()[action]
+
+    def _calculate_loss(self, target_fn: Callable) -> tf.Tensor:
+        prev_Qs = tf.boolean_mask(
+            self.model(self.buffer['prev_states']),
+            self.masks[self.buffer['prev_actions']]
+        )
+
+        target = target_fn(
+            self.buffer['rewards'],
+            self.buffer['next_states'],
+            self.buffer['next_actions'],
+            self.buffer['next_is_terminal'],
+        )
+
+        loss = tf.reduce_mean(tf.square(target - prev_Qs))
+
+        return loss
+
+    def update(
+        self,
+        last_state: Union[int, float, npt.NDArray[np.float64]],
+        last_action: int,
+        reward: float,
+        new_state: Union[int, float, npt.NDArray[np.float64]],
+        new_action: int,
+        target_fn: Callable,
+    ) -> None:
+        self.buffer.add(
+            last_state,
+            last_action,
+            reward,
+            new_state,
+            new_action,
+            self.is_terminal_fn(new_state),
+        )
+
+        with tf.GradientTape() as tape:
+            loss = self._calculate_loss(target_fn)
+
+        grads = tape.gradient(loss, self.model.trainable_variables)
+        self.optimizer.apply_gradients(
+            zip(grads, self.model.trainable_variables)
+        )
+
+    def run_scheduler(self, step: int, episode: int) -> None:
+        """
+        Runs the scheduler of the approximator to vary its step size during
+        training.
+        """
+        if self.scheduler:
+            self.optimizer.learning_rate = self.scheduler(step, episode)
