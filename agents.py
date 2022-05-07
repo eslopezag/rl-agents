@@ -1,6 +1,7 @@
 from typing import Optional, Union, Tuple
 from abc import ABC, abstractmethod
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 from numpy import typing as npt
@@ -27,7 +28,6 @@ class AgentBase(ABC):
         exploration_policy: PolicyBase,
         discount: float = 1.,
         mode: str = 'training',
-        output_filename: Optional[str] = None,
     ) -> None:
 
         self.env = env
@@ -45,14 +45,6 @@ class AgentBase(ABC):
         self.exploration_policy.set_Q(Q)
 
         self.discount = discount
-
-        if output_filename:
-            self.output_filename = output_filename
-        else:
-            self.output_filename = '{agent}_{timestamp}'.format(
-                agent=self.__class__.__qualname__,
-                timestamp=datetime.now().timestamp()
-            )
 
         if mode == 'training' or mode == 'inference':
             self.mode = mode
@@ -181,18 +173,58 @@ class AgentBase(ABC):
 
         self.env.close()
 
-        if isinstance(self.Q, np.ndarray) and max(self.Q.shape) <= 128:
+        if isinstance(self.Q, np.ndarray) and self.Q.size <= 1024:
             print(self.Q)
+
+    def show_training_results(self, *args, **kwargs) -> None:
+        self.history.show_training_results(*args, **kwargs)
+
+    def save(self, output_folder: str) -> None:
+        if output_folder is not None:
+            folder_path = Path(output_folder)
+        else:
+            folder_path = Path(
+                '{agent}_{timestamp}'.format(
+                    agent=self.__class__.__qualname__,
+                    timestamp=datetime.now().timestamp()
+                )
+            )
+
+        if not folder_path.exists():
+            folder_path.mkdir()
+
+        if hasattr(self.Q, 'model'):
+            # Save the Keras model:
+            self.Q.model.save(folder_path / 'model')
+            del self.Q.model
 
         # This step seems to be necessary so that dill properly saves the `Q`
         # attribute of the object in the call to `dill.dump`:
         dill.dumps(self.Q, byref=False, recurse=True)
 
-        with open(f'{self.output_filename}.dill', 'wb') as fopen:
+        with open(folder_path / 'agent.dill', 'wb') as fopen:
             dill.dump(self, fopen, byref=False, recurse=True)
 
-    def show_training_results(self) -> None:
-        self.history.show_training_results()
+    @staticmethod
+    def load(folder_path: Optional[str] = None) -> 'AgentBase':
+        folder_path = Path(folder_path)
+        agent_path = folder_path / 'agent.dill'
+        model_path = folder_path / 'model'
+
+        if not (folder_path.is_dir() and agent_path.exists()):
+            raise ValueError(
+                'The given path does not point to a folder or the folder '
+                'does not contain an `agent.dill` file.'
+            )
+
+        with agent_path.open('rb') as fopen:
+            agent = dill.load(fopen)
+
+        if model_path.is_dir():
+            model = tf.keras.load_model(model_path)
+            agent.Q.model = model
+
+        return agent
 
 
 class TabularSarsaAgent(AgentBase):
@@ -204,7 +236,6 @@ class TabularSarsaAgent(AgentBase):
         target_policy: PolicyBase,
         discount: float = 1.,
         mode: str = 'training',
-        output_filename: Optional[str] = None,
     ) -> None:
         super().__init__(
             env=env,
@@ -215,7 +246,6 @@ class TabularSarsaAgent(AgentBase):
             exploration_policy=target_policy,
             discount=discount,
             mode=mode,
-            output_filename=output_filename,
         )
         self.policy = target_policy
 
@@ -246,7 +276,6 @@ class TabularQLearningAgent(AgentBase):
         exploration_policy: PolicyBase,
         discount: float = 1.,
         mode: str = 'training',
-        output_filename: Optional[str] = None,
     ) -> None:
         super().__init__(
             env=env,
@@ -257,7 +286,6 @@ class TabularQLearningAgent(AgentBase):
             exploration_policy=exploration_policy,
             discount=discount,
             mode=mode,
-            output_filename=output_filename,
         )
 
     def get_action(self, state) -> int:
@@ -288,7 +316,6 @@ class TabularExpectedSarsaAgent(AgentBase):
         exploration_policy: PolicyBase,
         discount: float = 1.,
         mode: str = 'training',
-        output_filename: Optional[str] = None,
     ) -> None:
         super().__init__(
             env=env,
@@ -299,7 +326,6 @@ class TabularExpectedSarsaAgent(AgentBase):
             exploration_policy=exploration_policy,
             discount=discount,
             mode=mode,
-            output_filename=output_filename,
         )
 
     def get_action(self, state) -> int:
@@ -335,7 +361,6 @@ class SemiGradSarsaAgent(AgentBase):
         target_policy: PolicyBase,
         discount: float = 1.,
         mode: str = 'training',
-        output_filename: Optional[str] = None,
     ) -> None:
         super().__init__(
             env=env,
@@ -346,7 +371,6 @@ class SemiGradSarsaAgent(AgentBase):
             exploration_policy=target_policy,
             discount=discount,
             mode=mode,
-            output_filename=output_filename,
         )
         self.policy = target_policy
 
@@ -391,7 +415,6 @@ class SemiGradQLearningAgent(AgentBase):
         exploration_policy: PolicyBase,
         discount: float = 1.,
         mode: str = 'training',
-        output_filename: Optional[str] = None,
     ) -> None:
         super().__init__(
             env=env,
@@ -402,7 +425,6 @@ class SemiGradQLearningAgent(AgentBase):
             exploration_policy=exploration_policy,
             discount=discount,
             mode=mode,
-            output_filename=output_filename,
         )
 
     def get_action(self, state) -> int:
@@ -447,7 +469,6 @@ class SemiGradExpectedSarsaAgent(AgentBase):
         exploration_policy: PolicyBase,
         discount: float = 1.,
         mode: str = 'training',
-        output_filename: Optional[str] = None,
     ) -> None:
         super().__init__(
             env=env,
@@ -458,7 +479,6 @@ class SemiGradExpectedSarsaAgent(AgentBase):
             exploration_policy=exploration_policy,
             discount=discount,
             mode=mode,
-            output_filename=output_filename,
         )
 
     def get_action(self, state) -> int:
@@ -509,7 +529,6 @@ class TrueGradSarsaAgent(AgentBase):
         target_policy: PolicyBase,
         discount: float = 1.,
         mode: str = 'training',
-        output_filename: Optional[str] = None,
     ) -> None:
         super().__init__(
             env=env,
@@ -520,7 +539,6 @@ class TrueGradSarsaAgent(AgentBase):
             exploration_policy=target_policy,
             discount=discount,
             mode=mode,
-            output_filename=output_filename,
         )
         self.policy = target_policy
 
@@ -558,7 +576,6 @@ class TrueGradQLearningAgent(AgentBase):
         exploration_policy: PolicyBase,
         discount: float = 1.,
         mode: str = 'training',
-        output_filename: Optional[str] = None,
     ) -> None:
         super().__init__(
             env=env,
@@ -569,7 +586,6 @@ class TrueGradQLearningAgent(AgentBase):
             exploration_policy=exploration_policy,
             discount=discount,
             mode=mode,
-            output_filename=output_filename,
         )
 
     def get_action(self, state) -> int:
@@ -607,7 +623,6 @@ class TrueGradExpectedSarsaAgent(AgentBase):
         exploration_policy: PolicyBase,
         discount: float = 1.,
         mode: str = 'training',
-        output_filename: Optional[str] = None,
     ) -> None:
         super().__init__(
             env=env,
@@ -618,7 +633,6 @@ class TrueGradExpectedSarsaAgent(AgentBase):
             exploration_policy=exploration_policy,
             discount=discount,
             mode=mode,
-            output_filename=output_filename,
         )
 
     def get_action(self, state) -> int:
@@ -651,3 +665,7 @@ class TrueGradExpectedSarsaAgent(AgentBase):
         )
 
         return rewards + self.discount * next_Q
+
+
+def load_agent(folder_path: str) -> AgentBase:
+    return AgentBase.load(folder_path)

@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Union
+from typing import Union, Tuple
 from itertools import chain
 
 import numpy as np
@@ -44,12 +44,17 @@ class TabularAgentHistory(AgentHistoryBase):
     def register_episode_end(self) -> None:
         self.episode_ends.append(len(self.reward_history) - 1)
 
-    def show_training_results(self) -> None:
-        fig, ax = plt.subplots(figsize=(10, 21))
+    def show_training_results(
+        self,
+        episode_window: int,
+        figsize: Tuple[int] = (10, 6)
+    ) -> None:
+        fig, ax = plt.subplots(figsize=figsize)
 
         ax.set_xlabel('Episode')
         ax.set_ylabel(
-            'Running average of episode reward (window size = 100)'
+            'Running average of episode reward (window size = '
+            f'{episode_window})'
         )
         episode_rewards = [
             sum(r for r in self.reward_history[i + 1: j + 1] if r is not None)
@@ -59,7 +64,12 @@ class TabularAgentHistory(AgentHistoryBase):
             )
         ]
         cumsum = np.cumsum(np.insert(episode_rewards, 0, 0))
-        running_avg = (cumsum[100:] - cumsum[:-100]) / 100
-        ax.plot(range(100, len(running_avg) + 100), running_avg)
+        running_avg = (
+            cumsum[episode_window:] - cumsum[:-episode_window]
+        ) / episode_window
+        ax.plot(
+            range(episode_window, len(running_avg) + episode_window),
+            running_avg
+        )
 
         plt.show(block=True)
