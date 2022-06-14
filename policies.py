@@ -31,41 +31,37 @@ def multi_argmax(arr: npt.NDArray[np.float64]) -> npt.NDArray[np.int64]:
     return np.flatnonzero(arr == np.max(arr))
 
 
-def random_argmax(arr: npt.NDArray[np.float64]) -> int:
+def random_argmax(
+    arr: npt.NDArray[np.float64], axis: Optional[int] = None
+) -> int:
     """
-    Gets the index of the maximum value of the array, breaking ties randomly.
+    Gets the index of the maximum value of the array along the given axis,
+    breaking ties randomly.
     """
-    return np.random.choice(multi_argmax(arr))
+    if axis is None:
+        return np.random.choice(multi_argmax(arr))
+    else:
+        return np.argmax(
+            (1. + np.random.sample(arr.shape)) *
+            (arr == np.max(arr, axis=axis, keepdims=True)),
+            axis=axis
+        )
 
 
 def softmax_tau(
     arr: npt.NDArray[np.float64],
     tau: float,
+    axis: Optional[int] = None,
 ) -> npt.NDArray[np.float64]:
     """
-    Softmax function with temperature parameter `tau`.
-    """
-    res = arr / tau
-    res = np.exp(res - np.max(res))  # np.max(res) is subtracted for stability
-    res = res / np.sum(res)
-
-    return res
-
-
-def softmax_tau_batch(
-    arr: tf.Tensor,  # shape: (n_samples, n_actions)
-    tau: float,
-) -> npt.NDArray[np.float64]:
-    """
-    Softmax function with temperature parameter `tau` over a batch of samples
-    given as a TensorFlow tensor.
+    Softmax function with temperature parameter `tau` along the given axis.
     """
     res = arr / tau
 
     # The row-wise maximum is subtracted for stability:
-    res = tf.exp(res - tf.reduce_max(res, axis=1, keepdims=True))
+    res = np.exp(res - np.max(res, axis=axis, keepdims=True))
 
-    res = res / tf.reduce_sum(res, axis=1, keepdims=True)
+    res = res / np.sum(res, axis=axis, keepdims=True)
 
     return res
 
@@ -73,6 +69,26 @@ def softmax_tau_batch(
 class PolicyBase(ABC):
     @abstractmethod
     def get_action(self, state: StateType) -> int:
+        pass
+
+    @abstractmethod
+    def get_actions_from_Q_batch(
+        self,
+        Q_state_batch: tf.Tensor,  # shape: (n_samples, n_actions)
+    ) -> int:
+        """
+        Selects actions given the action-values associated with a batch of
+        states in a vectorized manner.
+
+        Args:
+            Q_state_batch:
+                a two-dimensional array such that its (i, j) component is the
+                estimated action-value of the j-th action when the agent is at
+                the i-th item of a batch of states.
+
+        Returns:
+            A one-dimensional array of selected actions.
+        """
         pass
 
     @abstractmethod
@@ -185,6 +201,27 @@ class TabularActionsPolicyBase(PolicyBase, ABC):
         pass
 
     @abstractmethod
+    @check_Q_is_set
+    def get_actions_from_Q_batch(
+        self,
+        Q_state_batch: tf.Tensor,  # shape: (n_samples, n_actions)
+    ) -> int:
+        """
+        Selects actions given the action-values associated with a batch of
+        states in a vectorized manner.
+
+        Args:
+            Q_state_batch:
+                a two-dimensional array such that its (i, j) component is the
+                estimated action-value of the j-th action when the agent is at
+                the i-th item of a batch of states.
+
+        Returns:
+            A one-dimensional array of selected actions.
+        """
+        pass
+
+    @abstractmethod
     def get_probs(self, state: StateType) -> npt.NDArray[np.float64]:
         """
         Returns an array with the probability of each action being selected by
@@ -239,6 +276,26 @@ class GreedyPolicy(TabularActionsPolicyBase):
     @check_Q_is_set
     def get_action(self, state: StateType) -> int:
         return self._get_greedy_action(state)
+
+    @check_Q_is_set
+    def get_actions_from_Q_batch(
+        self,
+        Q_state_batch: tf.Tensor,  # shape: (n_samples, n_actions)
+    ) -> int:
+        """
+        Selects actions given the action-values associated with a batch of
+        states in a vectorized manner.
+
+        Args:
+            Q_state_batch:
+                a two-dimensional array such that its (i, j) component is the
+                estimated action-value of the j-th action when the agent is at
+                the i-th item of a batch of states.
+
+        Returns:
+            A one-dimensional array of selected actions.
+        """
+        return random_argmax(Q_state_batch.numpy(), axis=1)
 
     @check_Q_is_set
     def get_probs(self, state: StateType) -> npt.NDArray[np.float64]:
@@ -326,6 +383,30 @@ class EpsGreedyPolicy(TabularActionsPolicyBase):
             return np.random.randint(self.n_actions)
         else:
             return self._get_greedy_action(state)
+
+    @check_Q_is_set
+    def get_actions_from_Q_batch(
+        self,
+        Q_state_batch: tf.Tensor,  # shape: (n_samples, n_actions)
+    ) -> int:
+        """
+        Selects actions given the action-values associated with a batch of
+        states in a vectorized manner.
+
+        Args:
+            Q_state_batch:
+                a two-dimensional array such that its (i, j) component is the
+                estimated action-value of the j-th action when the agent is at
+                the i-th item of a batch of states.
+
+        Returns:
+            A one-dimensional array of selected actions.
+        """
+        return np.where(
+            np.random.sample(size=Q_state_batch.shape[0]) < self.eps,
+            np.random.randint(self.n_actions, size=Q_state_batch.shape[0]),
+            random_argmax(Q_state_batch.numpy(), axis=1),
+        )
 
     @check_Q_is_set
     def get_probs(self, state: StateType) -> npt.NDArray[np.float64]:
@@ -423,7 +504,7 @@ class SoftmaxPolicy(TabularActionsPolicyBase):
     @check_Q_is_set
     def get_action(self, state: StateType):
         return np.random.choice(
-            range(self.n_actions),
+            self.n_actions,
             p=softmax_tau(self.Q[state], self.tau),
         )
 
@@ -462,8 +543,36 @@ class SoftmaxPolicy(TabularActionsPolicyBase):
                 '`Q` attribute is a `GradQApproximator` object.'
             )
 
-        probs = softmax_tau_batch(Q_state_batch, self.tau)
+        probs = softmax_tau(Q_state_batch.numpy(), self.tau, axis=1)
         return probs
+
+    @check_Q_is_set
+    def get_actions_from_Q_batch(
+        self,
+        Q_state_batch: tf.Tensor,  # shape: (n_samples, n_actions)
+    ) -> int:
+        """
+        Selects actions given the action-values associated with a batch of
+        states in a vectorized manner.
+
+        Args:
+            Q_state_batch:
+                a two-dimensional array such that its (i, j) component is the
+                estimated action-value of the j-th action when the agent is at
+                the i-th item of a batch of states.
+
+        Returns:
+            A one-dimensional array of selected actions.
+        """
+        probs = self.get_probs_from_Q_batch(Q_state_batch)
+
+        # Code to get indices according to a 2D array of probabilities taken
+        # from https://stackoverflow.com/a/47722393/13752339:
+        return np.argmax(
+            probs.cumsum(axis=1) >
+            np.random.sample(Q_state_batch.shape[0])[:, None],
+            axis=1
+        )
 
     def run_scheduler(self, step: int, episode: int) -> None:
         if self.scheduler:

@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Union, Tuple
+from typing import Union, Tuple, Optional, Dict
 
 import numpy as np
 from numpy import typing as npt
@@ -37,7 +37,7 @@ class ExperienceBufferBase(ABC):
         elif isinstance(states[0], np.ndarray):
             return states
 
-    def __getitem__(self, key):
+    def __getitem__(self, key) -> Dict[str, npt.NDArray[np.float64]]:
         if self.is_full:
             return self._buffer[key]
         else:
@@ -59,6 +59,33 @@ class ExperienceBufferBase(ABC):
         self._buffer['next_states'][index] = next_state
         self._buffer['next_actions'][index] = next_action
         self._buffer['next_is_terminal'][index] = next_is_terminal
+
+    @property
+    def used_buffer_size(self):
+        """
+        Returns the number of experience items currently stored in the buffer,
+        which can be less than its total capacity, given by `self.buffer_size`.
+        """
+        if self.is_full:
+            return self.buffer_size
+        else:
+            return self.last_index_added + 1
+
+    def get_sample(
+        self, size: Optional[int] = None
+    ) -> Dict[str, npt.NDArray[np.float64]]:
+        """
+        Gets a random sample of the experience buffer with the given size. If
+        `size` is `None`, the whole buffer is returned.
+        """
+        used_buffer_size = self.used_buffer_size
+
+        if size is None or size > used_buffer_size:
+            return {key: self[key] for key in self._buffer}
+
+        # Get random indices:
+        indices = np.random.choice(used_buffer_size, size, replace=False)
+        return {key: self[key][indices] for key in self._buffer}
 
     @abstractmethod
     def add(

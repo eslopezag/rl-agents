@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Optional, Union, List, Callable, Tuple
+from typing import Optional, Union, List, Callable, Tuple, Dict
 
 import numpy as np
 from numpy import typing as npt
@@ -150,19 +150,44 @@ class TabularQApproximator(np.ndarray, QApproximatorBase):
 class GradQApproximator(QApproximatorBase):
     def __init__(
         self,
-        model: Callable,
+        model: tf.keras.Model,
         optimizer: tf.keras.optimizers.Optimizer,
+        target_delay_steps: int,
+        batch_size: int,
         state_dim: int,
         buffer_size: int,
         buffer_class: type = OrderedExperienceBuffer,
+        batches_per_step: int = 1,
+        start_training_buffer_size: int = 1,
         scheduler: Optional[Callable] = None,
         is_terminal_fn: Optional[Callable] = None,
         *,
         env: Optional[gym.Env] = None,
         n_actions: Optional[int] = None,
     ) -> None:
+        self.training_steps = 0
+
         self.model = model
         self.optimizer = optimizer
+        self.target_delay_steps = target_delay_steps
+        self.batch_size = batch_size
+
+        if target_delay_steps == 1:
+            self.target_model = model
+
+        elif target_delay_steps > 1:
+
+            if not self.model.built:
+                self.model.build((state_dim,))
+
+            self.target_model = tf.keras.models.clone_model(self.model)
+            self.target_model.set_weights(self.model.get_weights())
+
+        else:
+            raise ValueError(
+                'The `target_delay_steps` parameter must be a positive '
+                'integer.'
+            )
 
         if not ExperienceBufferBase.__subclasscheck__(buffer_class):
             raise ValueError(
@@ -171,6 +196,15 @@ class GradQApproximator(QApproximatorBase):
             )
 
         self.buffer = buffer_class(buffer_size, state_dim)
+
+        if isinstance(batches_per_step, int) and batches_per_step > 0:
+            self.batches_per_step = batches_per_step
+        else:
+            raise ValueError(
+                'The `batches_per_step` parameter must be a positive integer.'
+            )
+
+        self.start_training_buffer_size = start_training_buffer_size
         self.scheduler = scheduler
         self.is_terminal_fn = is_terminal_fn
 
@@ -210,22 +244,34 @@ class GradQApproximator(QApproximatorBase):
         else:
             return self.model.predict(state[None]).squeeze()[action]
 
-    def _calculate_loss(self, target_fn: Callable) -> tf.Tensor:
+    def _get_buffer_sample(self) -> Dict[str, npt.NDArray[np.float64]]:
+        return self.buffer.get_sample(self.batch_size)
+
+    def _calculate_loss(
+            self,
+            sample: Dict[str, npt.NDArray[np.float64]],
+            target_fn: Callable,
+            return_error: bool = False,
+    ) -> tf.Tensor:
         prev_Qs = tf.boolean_mask(
-            self.model(self.buffer['prev_states']),
-            self.masks[self.buffer['prev_actions']]
+            self.model(sample['prev_states']),
+            self.masks[sample['prev_actions']]
         )
 
         target = target_fn(
-            self.buffer['rewards'],
-            self.buffer['next_states'],
-            self.buffer['next_actions'],
-            self.buffer['next_is_terminal'],
+            sample['rewards'],
+            sample['next_states'],
+            sample['next_actions'],
+            sample['next_is_terminal'],
         )
 
-        loss = tf.reduce_mean(tf.square(target - prev_Qs))
-
-        return loss
+        if return_error:
+            error = target - prev_Qs
+            loss = tf.reduce_mean(tf.square(error))
+            return loss, error
+        else:
+            loss = tf.reduce_mean(tf.square(target - prev_Qs))
+            return loss
 
     def update(
         self,
@@ -245,13 +291,25 @@ class GradQApproximator(QApproximatorBase):
             self.is_terminal_fn(new_state),
         )
 
-        with tf.GradientTape() as tape:
-            loss = self._calculate_loss(target_fn)
+        if self.buffer.used_buffer_size >= self.start_training_buffer_size:
+            self.training_steps += 1
 
-        grads = tape.gradient(loss, self.model.trainable_variables)
-        self.optimizer.apply_gradients(
-            zip(grads, self.model.trainable_variables)
-        )
+            experience_buffer_sample = self._get_buffer_sample()
+
+            for _ in range(self.batches_per_step):
+                with tf.GradientTape() as tape:
+                    loss = self._calculate_loss(
+                        experience_buffer_sample, target_fn
+                    )
+
+                grads = tape.gradient(loss, self.model.trainable_variables)
+                self.optimizer.apply_gradients(
+                    zip(grads, self.model.trainable_variables)
+                )
+
+            # Update the target model every `self.target_delay_steps` steps:
+            if self.training_steps % self.target_delay_steps == 0:
+                self.target_model.set_weights(self.model.get_weights())
 
     def run_scheduler(self, step: int, episode: int) -> None:
         """
@@ -260,3 +318,79 @@ class GradQApproximator(QApproximatorBase):
         """
         if self.scheduler:
             self.optimizer.learning_rate = self.scheduler(step, episode)
+
+
+class AvgRewardGradQApproximator(GradQApproximator):
+    def __init__(
+        self,
+        model: tf.keras.Model,
+        optimizer: tf.keras.optimizers.Optimizer,
+        target_delay_steps: int,
+        batch_size: int,
+        state_dim: int,
+        avg_reward_step_size: float,
+        buffer_size: int,
+        buffer_class: type = OrderedExperienceBuffer,
+        batches_per_step: int = 1,
+        start_training_buffer_size: int = 1,
+        step_size_scheduler: Optional[Callable] = None,
+        avg_reward_step_size_scheduler: Optional[Callable] = None,
+        initial_avg_reward: float = 0.,
+        is_terminal_fn: Optional[Callable] = None,
+        *,
+        env: Optional[gym.Env] = None,
+        n_actions: Optional[int] = None,
+    ) -> None:
+        super().__init__(
+            model,
+            optimizer,
+            target_delay_steps,
+            batch_size,
+            state_dim,
+            buffer_size,
+            buffer_class,
+            batches_per_step,
+            start_training_buffer_size,
+            step_size_scheduler,
+            is_terminal_fn,
+            env=env,
+            n_actions=n_actions,
+        )
+
+        self.avg_reward = initial_avg_reward
+        self.avg_reward_step_size = avg_reward_step_size
+        self.avg_reward_step_size_scheduler = avg_reward_step_size_scheduler
+
+    def update(
+        self,
+        last_state: Union[int, float, npt.NDArray[np.float64]],
+        last_action: int,
+        reward: float,
+        new_state: Union[int, float, npt.NDArray[np.float64]],
+        new_action: int,
+        target_fn: Callable,
+    ) -> None:
+        self.avg_reward += (
+            self.avg_reward_step_size * (reward - self.avg_reward)
+        )
+
+        return super().update(
+            last_state,
+            last_action,
+            reward,
+            new_state,
+            new_action,
+            target_fn,
+        )
+
+    def run_scheduler(self, step: int, episode: int) -> None:
+        """
+        Runs the scheduler of the approximator and the average reward to vary
+        their step sizes during training.
+        """
+        super().run_scheduler(step, episode)
+
+        if self.avg_reward_step_size_scheduler:
+            self.avg_reward_step_size_scheduler = (
+                self.avg_reward_step_size_scheduler(step, episode)
+            )

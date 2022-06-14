@@ -12,7 +12,10 @@ import dill
 
 from .agent_history import AgentHistoryBase, TabularAgentHistory
 from .q_approximators import (
-    QApproximatorBase, TabularQApproximator, GradQApproximator
+    QApproximatorBase,
+    TabularQApproximator,
+    GradQApproximator,
+    AvgRewardGradQApproximator,
 )
 from .policies import PolicyBase, GreedyPolicy
 
@@ -179,7 +182,7 @@ class AgentBase(ABC):
     def show_training_results(self, *args, **kwargs) -> None:
         self.history.show_training_results(*args, **kwargs)
 
-    def save(self, output_folder: str) -> None:
+    def save(self, output_folder: Optional[str] = None) -> None:
         if output_folder is not None:
             folder_path = Path(output_folder)
         else:
@@ -196,7 +199,18 @@ class AgentBase(ABC):
         if hasattr(self.Q, 'model'):
             # Save the Keras model:
             self.Q.model.save(folder_path / 'model')
+            model = self.Q.model
             del self.Q.model
+        else:
+            model = None
+
+        if hasattr(self.Q, 'target_model'):
+            # Save the Keras target model:
+            self.Q.target_model.save(folder_path / 'target_model')
+            target_model = self.Q.target_model
+            del self.Q.target_model
+        else:
+            target_model = None
 
         # This step seems to be necessary so that dill properly saves the `Q`
         # attribute of the object in the call to `dill.dump`:
@@ -205,11 +219,18 @@ class AgentBase(ABC):
         with open(folder_path / 'agent.dill', 'wb') as fopen:
             dill.dump(self, fopen, byref=False, recurse=True)
 
+        if model is not None:
+            self.Q.model = model
+
+        if target_model is not None:
+            self.Q.target_model = target_model
+
     @staticmethod
     def load(folder_path: Optional[str] = None) -> 'AgentBase':
         folder_path = Path(folder_path)
         agent_path = folder_path / 'agent.dill'
         model_path = folder_path / 'model'
+        target_model_path = folder_path / 'target_model'
 
         if not (folder_path.is_dir() and agent_path.exists()):
             raise ValueError(
@@ -221,8 +242,12 @@ class AgentBase(ABC):
             agent = dill.load(fopen)
 
         if model_path.is_dir():
-            model = tf.keras.load_model(model_path)
-            agent.Q.model = model
+            agent.Q.model = tf.keras.models.load_model(model_path)
+
+        if target_model_path.is_dir():
+            agent.Q.target_model = tf.keras.models.load_model(
+                target_model_path
+            )
 
         return agent
 
@@ -390,16 +415,21 @@ class SemiGradSarsaAgent(AgentBase):
         actions: npt.NDArray[np.int64],
         state_is_terminal: npt.NDArray[np.bool],
     ) -> float:
+        Q_state_batch = self.Q.target_model(states)
+
+        # Recalculate actions according to current policy:
+        actions = self.policy.get_actions_from_Q_batch(Q_state_batch)
+
         next_Q = tf.where(
             state_is_terminal,
             0.,
-            tf.boolean_mask(self.Q.model(states), self.Q.masks[actions])
+            tf.boolean_mask(Q_state_batch, self.Q.masks[actions])
         )
 
         target = rewards + self.discount * next_Q
 
         # This step makes sure that the target is not taken into account when
-        # differenating with respect to the model parameters so that a
+        # differentiating with respect to the model parameters so that a
         # semi-gradient update is performed:
         target = target.numpy()
 
@@ -446,13 +476,13 @@ class SemiGradQLearningAgent(AgentBase):
         next_Q = tf.where(
             state_is_terminal,
             0.,
-            tf.reduce_max(self.Q.model(states), axis=1)
+            tf.reduce_max(self.Q.target_model(states), axis=1)
         )
 
         target = rewards + self.discount * next_Q
 
         # This step makes sure that the target is not taken into account when
-        # differenating with respect to the model parameters so that a
+        # differentiating with respect to the model parameters so that a
         # semi-gradient update is performed:
         target = target.numpy()
 
@@ -498,7 +528,7 @@ class SemiGradExpectedSarsaAgent(AgentBase):
         actions: npt.NDArray[np.int64],
         state_is_terminal: npt.NDArray[np.bool],
     ) -> float:
-        Q_state_batch = self.Q.model(states)
+        Q_state_batch = self.Q.target_model(states)
 
         next_Q = tf.where(
             state_is_terminal,
@@ -513,23 +543,28 @@ class SemiGradExpectedSarsaAgent(AgentBase):
         target = rewards + self.discount * next_Q
 
         # This step makes sure that the target is not taken into account when
-        # differenating with respect to the model parameters so that a
+        # differentiating with respect to the model parameters so that a
         # semi-gradient update is performed:
         target = target.numpy()
 
         return target
 
 
-class TrueGradSarsaAgent(AgentBase):
+class AvgRewardSemiGradSarsaAgent(AgentBase):
     def __init__(
         self,
         env: gym.Env,
-        Q: GradQApproximator,
+        Q: AvgRewardGradQApproximator,
         history: AgentHistoryBase,
         target_policy: PolicyBase,
-        discount: float = 1.,
         mode: str = 'training',
     ) -> None:
+        if not isinstance(Q, AvgRewardGradQApproximator):
+            raise ValueError(
+                'The action value approximator for this agent must be an '
+                'instance of `AvgRewardGradQApproximator`.'
+            )
+
         super().__init__(
             env=env,
             Q=Q,
@@ -537,9 +572,11 @@ class TrueGradSarsaAgent(AgentBase):
             step_on_episode_start=False,
             target_policy=target_policy,
             exploration_policy=target_policy,
-            discount=discount,
+            discount=1.,
             mode=mode,
         )
+
+        del self.discount
         self.policy = target_policy
 
     def get_action(self, state) -> int:
@@ -558,82 +595,55 @@ class TrueGradSarsaAgent(AgentBase):
         actions: npt.NDArray[np.int64],
         state_is_terminal: npt.NDArray[np.bool],
     ) -> float:
+        Q_state_batch = self.Q.target_model(states)
+
+        # Recalculate actions according to current policy:
+        actions = self.policy.get_actions_from_Q_batch(Q_state_batch)
+
         next_Q = tf.where(
             state_is_terminal,
             0.,
-            tf.boolean_mask(self.Q.model(states), self.Q.masks[actions])
+            tf.boolean_mask(Q_state_batch, self.Q.masks[actions])
         )
 
-        return rewards + self.discount * next_Q
+        target = rewards - self.Q.avg_reward + next_Q
+
+        # This step makes sure that the target is not taken into account when
+        # differentiating with respect to the model parameters so that a
+        # semi-gradient update is performed:
+        target = target.numpy()
+
+        return target
 
 
-class TrueGradQLearningAgent(AgentBase):
+class AvgRewardSemiGradExpectedSarsaAgent(AgentBase):
     def __init__(
         self,
         env: gym.Env,
-        Q: GradQApproximator,
-        history: TabularAgentHistory,
-        exploration_policy: PolicyBase,
-        discount: float = 1.,
-        mode: str = 'training',
-    ) -> None:
-        super().__init__(
-            env=env,
-            Q=Q,
-            history=history,
-            step_on_episode_start=False,
-            target_policy=GreedyPolicy(),
-            exploration_policy=exploration_policy,
-            discount=discount,
-            mode=mode,
-        )
-
-    def get_action(self, state) -> int:
-        return super().get_action(state)
-
-    def _reset_env(self) -> Union[int, float, npt.NDArray[np.float64]]:
-        return super()._reset_env()
-
-    def run_policies_schedulers(self) -> None:
-        self.exploration_policy.run_scheduler(self.step, self.episode)
-
-    def target_fn(
-        self,
-        rewards: npt.NDArray[np.float64],
-        states: npt.NDArray[np.float64],  # Two-dimensional array
-        actions: npt.NDArray[np.int64],
-        state_is_terminal: npt.NDArray[np.bool],
-    ) -> float:
-        next_Q = tf.where(
-            state_is_terminal,
-            0.,
-            tf.reduce_max(self.Q.model(states), axis=1)
-        )
-
-        return rewards + self.discount * next_Q
-
-
-class TrueGradExpectedSarsaAgent(AgentBase):
-    def __init__(
-        self,
-        env: gym.Env,
-        Q: GradQApproximator,
-        history: TabularAgentHistory,
+        Q: AvgRewardGradQApproximator,
+        history: AgentHistoryBase,
         target_policy: PolicyBase,
-        exploration_policy: PolicyBase,
-        discount: float = 1.,
         mode: str = 'training',
     ) -> None:
+        if not isinstance(Q, AvgRewardGradQApproximator):
+            raise ValueError(
+                'The action value approximator for this agent must be an '
+                'instance of `AvgRewardGradQApproximator`.'
+            )
+
         super().__init__(
             env=env,
             Q=Q,
             history=history,
             step_on_episode_start=False,
             target_policy=target_policy,
-            exploration_policy=exploration_policy,
-            discount=discount,
+            exploration_policy=target_policy,
+            discount=1.,
             mode=mode,
         )
+
+        del self.discount
+        self.policy = target_policy
 
     def get_action(self, state) -> int:
         return super().get_action(state)
@@ -642,8 +652,7 @@ class TrueGradExpectedSarsaAgent(AgentBase):
         return super()._reset_env()
 
     def run_policies_schedulers(self) -> None:
-        self.target_policy.run_scheduler(self.step, self.episode)
-        self.exploration_policy.run_scheduler(self.step, self.episode)
+        self.policy.run_scheduler(self.step, self.episode)
 
     def target_fn(
         self,
@@ -652,7 +661,7 @@ class TrueGradExpectedSarsaAgent(AgentBase):
         actions: npt.NDArray[np.int64],
         state_is_terminal: npt.NDArray[np.bool],
     ) -> float:
-        Q_state_batch = self.Q.model(states)
+        Q_state_batch = self.Q.target_model(states)
 
         next_Q = tf.where(
             state_is_terminal,
@@ -664,7 +673,14 @@ class TrueGradExpectedSarsaAgent(AgentBase):
             )
         )
 
-        return rewards + self.discount * next_Q
+        target = rewards - self.Q.avg_reward + next_Q
+
+        # This step makes sure that the target is not taken into account when
+        # differentiating with respect to the model parameters so that a
+        # semi-gradient update is performed:
+        target = target.numpy()
+
+        return target
 
 
 def load_agent(folder_path: str) -> AgentBase:
